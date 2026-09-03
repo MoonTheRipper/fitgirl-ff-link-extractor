@@ -3,7 +3,11 @@ name: Build Windows EXE
 on:
   push:
     branches: [ main ]
+    tags: [ 'v*' ]
   workflow_dispatch:
+
+permissions:
+  contents: write
 
 jobs:
   build:
@@ -11,10 +15,10 @@ jobs:
 
     steps:
     - name: Checkout code
-      uses: actions/checkout@v4  # Updated to v4
+      uses: actions/checkout@v4
 
     - name: Set up Python
-      uses: actions/setup-python@v5 # Updated to v5
+      uses: actions/setup-python@v5
       with:
         python-version: '3.11'
 
@@ -28,7 +32,21 @@ jobs:
         pyinstaller --onefile --noconsole --name="FitGirl_FF_Link_Extractor" ff_grabber.py
 
     - name: Upload EXE Artifact
-      uses: actions/upload-artifact@v4 # Updated to v4
+      uses: actions/upload-artifact@v4
       with:
         name: FitGirl_FF_Link_Extractor-Windows
         path: dist/FitGirl_FF_Link_Extractor.exe
+
+    # Tag builds also land on the release, so a published version is never
+    # source-only. Creates the release if the tag was pushed first.
+    - name: Attach EXE to release
+      if: startsWith(github.ref, 'refs/tags/v')
+      shell: bash
+      env:
+        GH_TOKEN: ${{ github.token }}
+      run: |
+        TAG="${GITHUB_REF_NAME}"
+        gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1 \
+          || gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --title "$TAG" --generate-notes
+        gh release upload "$TAG" dist/FitGirl_FF_Link_Extractor.exe \
+          --repo "$GITHUB_REPOSITORY" --clobber
