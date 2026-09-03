@@ -1,10 +1,19 @@
 import setuptools  # Register distutils fallback
 import os
+import sys
 import traceback
 import datetime
 
 # --- TEMP DIAGNOSTICS (remove after debugging) ---
-DIAG_LOG = os.path.join(os.path.dirname(os.path.abspath(__file__)), "diagnostics.log")
+# Frozen builds unpack the source into a temp directory that is deleted on
+# exit, so __file__ is not somewhere the user can retrieve a log from. Write
+# next to the executable they actually launched instead.
+if getattr(sys, "frozen", False):
+    _APP_DIR = os.path.dirname(os.path.abspath(sys.executable))
+else:
+    _APP_DIR = os.path.dirname(os.path.abspath(__file__))
+
+DIAG_LOG = os.path.join(_APP_DIR, "diagnostics.log")
 
 def diag(msg, exc=False):
     line = f"[{datetime.datetime.now():%H:%M:%S}] {msg}"
