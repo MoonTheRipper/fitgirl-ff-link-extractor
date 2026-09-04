@@ -337,9 +337,9 @@ class FitgirlExtractorApp:
         driver = None
         total = len(links)
         
-        # 1. Discover the best browser automatically
         selected_browser = self.browser_var.get()
         browser_executable = self.get_browser_path(selected_browser)
+        
         if not browser_executable:
             self.root.after(0, self.update_ui, f"Error: Could not find {selected_browser} on your system.")
             self.root.after(0, lambda: self.fetch_btn.config(state="normal"))
@@ -349,7 +349,6 @@ class FitgirlExtractorApp:
         browser_name = os.path.basename(browser_executable).replace('.exe', '')
         self.root.after(0, self.update_ui, f"Initializing using {browser_name} to bypass Cloudflare...", 0, total)
         
-        # Helper function to generate driver safely
         def create_driver(version=None):
             if browser_name.lower() == 'firefox':
                 from selenium import webdriver
@@ -359,20 +358,16 @@ class FitgirlExtractorApp:
                 opts.set_preference("dom.webdriver.enabled", False)
                 opts.set_preference("useAutomationExtension", False)
                 return webdriver.Firefox(options=opts)
-                
             elif browser_name.lower() == 'msedge':
                 from selenium import webdriver
                 from selenium.webdriver.edge.options import Options
                 opts = Options()
                 opts.binary_location = browser_executable
-                # Basic stealth for standard Edge driver
                 opts.add_experimental_option("excludeSwitches", ["enable-automation"])
                 opts.add_experimental_option('useAutomationExtension', False)
                 opts.add_argument("--disable-blink-features=AutomationControlled")
                 return webdriver.Edge(options=opts)
-                
             else:
-                # Chrome and Brave use the powerful undetected-chromedriver
                 opts = uc.ChromeOptions()
                 return uc.Chrome(
                     options=opts, 
@@ -382,93 +377,96 @@ class FitgirlExtractorApp:
                 )
         
         try:
-            # 2. Driver Auto-Version Logic
             try:
                 driver = create_driver()
             except Exception as e:
                 error_msg = str(e)
-                # Only apply the uc.Chrome auto-version fix to Chrome/Brave
                 if browser_name.lower() not in ['firefox', 'msedge'] and "Current browser version is" in error_msg:
-                    # Extract the major version number the user ACTUALLY has installed
                     match = re.search(r"Current browser version is (\d+)", error_msg)
                     if match:
                         correct_version = int(match.group(1))
                         self.root.after(0, self.update_ui, f"Auto-fixing ChromeDriver version to v{correct_version}...")
                         driver = create_driver(version=correct_version)
                     else:
-                        raise e # Re-raise if regex fails
+                        raise e
                 else:
-                    raise e # Re-raise if it's a different error
-            # ---------------------------------------
+                    raise e
 
-            # Dynamic wait logic from PR
+            # --- Block downloads globally so Chrome doesn't actually download the 5GB files ---
+            if browser_name.lower() != 'firefox':
+                try:
+                    # (Removed the local 'import os' that was causing the crash!)
+                    driver.execute_cdp_cmd(
+                        "Browser.setDownloadBehavior", {
+                            "behavior": "deny",
+                            "downloadPath": os.path.abspath(os.sep)
+                        }
+                    )
+                except:
+                    pass
+            # ---------------------------------------------------------------------------------
+
+            # --- Javascript Interceptors ---
+            js_inject = """
+            // 1. Kill popup ads instantly
+            window.open = function() { return null; };
+            
+            // 2. Intercept the network request to catch the direct URL before HTMX processes it
+            if (!window.xhrIntercepted) {
+                window.xhrIntercepted = true;
+                var originalXHR = window.XMLHttpRequest;
+                window.XMLHttpRequest = function() {
+                    var xhr = new originalXHR();
+                    xhr.addEventListener('readystatechange', function() {
+                        if (xhr.readyState === 4) {
+                            var redirect = xhr.getResponseHeader('hx-redirect') || xhr.getResponseHeader('location');
+                            if (redirect && redirect.includes('dl.fuckingfast.co')) {
+                                document.body.setAttribute('data-direct-url', redirect);
+                            }
+                        }
+                    });
+                    return xhr;
+                };
+            }
+            """
+            
+            js_click = """
+            let btn = document.querySelector('a[hx-post]');
+            if (btn && btn.style.opacity !== '0.5') {
+                btn.click(); // Natively click the button!
+            }
+            return document.body.getAttribute('data-direct-url');
+            """
+            # -------------------------------
+
             for i, link in enumerate(links, 1):
                 filename = link.split('#')[-1] if '#' in link else link.split('/')[-1]
                 self.root.after(0, self.update_ui, f"Processing [{i}/{total}]: {filename}")
                 
                 try:
                     driver.get(link)
+                    driver.execute_script(js_inject)
                     
                     direct_url = None
-                    for _ in range(30):  
+                    for _ in range(30):
                         time.sleep(1)
-                        page_html = driver.page_source
                         
+                        # Click the button and check if our interceptor caught the URL
+                        result = driver.execute_script(js_click)
+                        if result and "dl.fuckingfast.co" in result:
+                            direct_url = result
+                            break
+                            
+                        # Fallback: check if the browser natively navigated to the link
+                        if "dl.fuckingfast.co" in driver.current_url:
+                            direct_url = driver.current_url
+                            break
+                            
                         # Fallback: Old window.open method
-                        match_old = re.search(r'window\.open\("([^"]+)"\)', page_html)
+                        match_old = re.search(r'window\.open\("([^"]+)"\)', driver.page_source)
                         if match_old:
                             direct_url = match_old.group(1)
                             break
-                            
-                        # NEW METHOD: HTMX Post Button
-                        match_new = re.search(r'hx-post="([^"]+)"', page_html)
-                        if match_new:
-                            # 1. Wait for Cloudflare to generate the Turnstile Token
-                            turnstile_token = driver.execute_script("return window.turnstileToken;")
-                            if not turnstile_token:
-                                continue  # Token isn't ready yet, keep waiting
-                                
-                            post_endpoint = match_new.group(1)
-                            
-                            # 2. Run the POST request INSIDE the browser using native JS fetch!
-                            # This bypasses the ad-click requirement and uses Chrome's own network stack 
-                            # so Cloudflare's TLS fingerprinting cannot block it.
-                            js_fetch = f"""
-                            var callback = arguments[0];
-                            fetch('{post_endpoint}', {{
-                                method: 'POST',
-                                headers: {{
-                                    'HX-Request': 'true',
-                                    'Content-Type': 'application/x-www-form-urlencoded'
-                                }},
-                                body: 'cf-turnstile-response=' + encodeURIComponent(window.turnstileToken)
-                            }}).then(response => {{
-                                let redirectUrl = response.headers.get('hx-redirect') || response.headers.get('location');
-                                if (redirectUrl) {{
-                                    callback(redirectUrl);
-                                }} else {{
-                                    response.text().then(t => callback(t));
-                                }}
-                            }}).catch(e => callback("ERROR"));
-                            """
-                            
-                            # Allow async script to wait for the fetch to resolve
-                            driver.set_script_timeout(10)
-                            try:
-                                result = driver.execute_async_script(js_fetch)
-                                
-                                if result:
-                                    if result.startswith("http"):
-                                        direct_url = result
-                                        break
-                                    else:
-                                        # If the server returned HTML text with the link instead of a redirect header
-                                        match_url = re.search(r'(https://dl\.fuckingfast\.co/dl/[^\'"]+)', result)
-                                        if match_url:
-                                            direct_url = match_url.group(1)
-                                            break
-                            except:
-                                pass # Keep trying if network blips
                             
                     if direct_url:
                         self.root.after(0, self.update_ui, None, i, None, direct_url)
